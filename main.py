@@ -11,6 +11,7 @@ import time
 import uuid
 from datetime import datetime
 
+import httpx
 import streamlit as st
 from supabase import create_client
 
@@ -129,7 +130,7 @@ def list_videos():
     out = []
     for it in res or []:
         name = it.get("name", "")
-        if not name or name.startswith(".") or not it.get("metadata"):
+        if not name or name.startswith(".") or not (it.get("id") or it.get("metadata")):
             continue
         out.append({
             "name": name,
@@ -140,24 +141,71 @@ def list_videos():
     return out
 
 
+def api_headers():
+    key = str(st.secrets["SUPABASE_KEY"])
+    return {"apikey": key, "Authorization": f"Bearer {key}"}
+
+
 def signed_url(name: str, ttl: int = 3600) -> str:
-    res = get_client().storage.from_(BUCKET).create_signed_url(name, ttl)
-    url = res.get("signedURL") or res.get("signedUrl") or ""
+    r = httpx.post(
+        f"{SUPABASE_URL}/storage/v1/object/sign/{BUCKET}/{name}",
+        headers=api_headers(), json={"expiresIn": ttl}, timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    url = data.get("signedURL") or data.get("signedUrl") or ""
     if url.startswith("/"):
         url = f"{SUPABASE_URL}/storage/v1{url}"
     return url
+
+
+def video_mime(name: str) -> str:
+    ext = name.rsplit(".", 1)[-1].lower()
+    return {"mp4": "video/mp4", "m4v": "video/mp4", "webm": "video/webm",
+            "mov": "video/quicktime", "mkv": "video/x-matroska",
+            "ogv": "video/ogg"}.get(ext, "video/mp4")
+
+
+def remote_content_type(url: str) -> str:
+    try:
+        r = httpx.get(url, headers={"Range": "bytes=0-0"}, timeout=30, follow_redirects=True)
+        return r.headers.get("content-type", "")
+    except Exception:
+        return ""
+
+
+@st.cache_data(max_entries=2, ttl=3600, show_spinner=False)
+def fetch_bytes(name: str) -> bytes:
+    r = httpx.get(signed_url(name), timeout=900, follow_redirects=True)
+    r.raise_for_status()
+    return r.content
+
+
+def render_player(name: str):
+    url = signed_url(name)
+    if remote_content_type(url).lower().startswith("video/"):
+        st.video(url)
+    else:  # file stored with a wrong content-type -> stream it through the server
+        with st.spinner("Loading video…"):
+            st.video(fetch_bytes(name), format=video_mime(name))
+    st.link_button("Open direct link", url)
 
 
 def upload_video(file, title: str):
     ext = "." + file.name.rsplit(".", 1)[-1].lower()
     slug = re.sub(r"[^A-Za-z0-9]+", "-", title or file.name.rsplit(".", 1)[0]).strip("-")[:60] or "video"
     path = f"{int(time.time())}-{uuid.uuid4().hex[:6]}__{slug}{ext}"
-    mime = file.type or mimetypes.guess_type(file.name)[0] or "video/mp4"
-    get_client().storage.from_(BUCKET).upload(
-        path=path,
-        file=file.getvalue(),
-        file_options={"content-type": mime, "upsert": "false"},
+    mime = mimetypes.guess_type(file.name)[0] or file.type or video_mime(file.name)
+    if not mime.startswith("video/"):
+        mime = video_mime(file.name)
+    r = httpx.post(
+        f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{path}",
+        headers={**api_headers(), "Content-Type": mime,
+                 "x-upsert": "false", "cache-control": "max-age=3600"},
+        content=file.getvalue(), timeout=1800,
     )
+    if r.status_code >= 400:
+        raise RuntimeError(f"{r.status_code}: {r.text[:200]}")
     return path
 
 
@@ -185,7 +233,7 @@ with tab_watch:
     if selected:
         vid = next(v for v in videos if v["name"] == selected)
         try:
-            st.video(signed_url(selected))
+            render_player(selected)
         except Exception as e:
             st.error(f"Could not play video: {e}")
         st.subheader(vid["title"])
