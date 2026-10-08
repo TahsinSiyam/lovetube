@@ -79,53 +79,143 @@ if page == "Upload Video":
             st.balloons()
 
 # --- GALLERY ---
+# --- GALLERY ---
+
 else:
-    st.header("🎥 Private Gallery")
+st.header("🎥 Private Gallery")
 
-    # 1) List files (show the real error if it fails)
-    try:
-        files = supabase.storage.from_(BUCKET_NAME).list()
-    except Exception as e:
-        st.error(f"Could not list videos: {e}")
-        st.info("Check that SUPABASE_KEY is the service_role key, not the anon key.")
-        st.stop()
+```
+# 1) List files
+try:
+    files = supabase.storage.from_(BUCKET_NAME).list()
+except Exception as e:
+    st.error(f"Could not list videos: {e}")
+    st.info("Check that SUPABASE_KEY is the service_role key, not the anon key.")
+    st.stop()
 
-    video_names = [f["name"] for f in (files or []) if f["name"] != ".emptyFolderPlaceholder"]
+# Only keep actual video files
+video_extensions = (
+    ".mp4",
+    ".webm",
+    ".mov",
+    ".m4v",
+    ".ogg",
+    ".ogv",
+    ".avi",
+    ".mkv",
+)
 
-    if not video_names:
-        st.info("No videos found. If you know you uploaded some, your key is probably the anon key.")
-    else:
-        selected_video = st.selectbox("Select a video to stream", video_names)
+video_names = [
+    f["name"]
+    for f in (files or [])
+    if f.get("name")
+    and f["name"] != ".emptyFolderPlaceholder"
+    and f["name"].lower().endswith(video_extensions)
+]
 
-        if selected_video:
-            # 2) Create a signed URL and make sure it's a full URL
-            video_url = None
+if not video_names:
+    st.info(
+        "No videos found. If you know you uploaded some, "
+        "your key may be the anon key or the bucket may be empty."
+    )
+else:
+    # 2) Select video
+    selected_video = st.selectbox(
+        "Select a video to watch",
+        video_names,
+        key="selected_video",
+    )
+
+    if selected_video:
+
+        # 3) Generate a fresh signed URL
+        #
+        # Supabase returns the complete signed URL.
+        # Do NOT manually prepend /storage/v1 or the project URL.
+        video_url = None
+
+        try:
+            signed = (
+                supabase.storage
+                .from_(BUCKET_NAME)
+                .create_signed_url(
+                    selected_video,
+                    3600,  # 1 hour
+                )
+            )
+
+            # supabase-py versions can expose slightly different
+            # capitalization for this field.
+            if isinstance(signed, dict):
+                video_url = (
+                    signed.get("signedURL")
+                    or signed.get("signedUrl")
+                    or signed.get("signed_url")
+                )
+
+            if not video_url:
+                raise ValueError(
+                    f"Supabase did not return a signed URL. "
+                    f"Response: {signed}"
+                )
+
+            # A browser video element needs a real absolute URL.
+            if not video_url.startswith(("http://", "https://")):
+                raise ValueError(
+                    f"Supabase returned an invalid video URL: {video_url}"
+                )
+
+        except Exception as e:
+            st.error(f"Could not create video link: {e}")
+            st.stop()
+
+        # 4) Determine MIME type
+        extension = selected_video.rsplit(".", 1)[-1].lower()
+
+        mime_types = {
+            "mp4": "video/mp4",
+            "webm": "video/webm",
+            "mov": "video/quicktime",
+            "m4v": "video/mp4",
+            "ogg": "video/ogg",
+            "ogv": "video/ogg",
+            "avi": "video/x-msvideo",
+            "mkv": "video/x-matroska",
+        }
+
+        video_format = mime_types.get(
+            extension,
+            "video/mp4",
+        )
+
+        # 5) Stream directly from Supabase
+        #
+        # The browser fetches the signed URL directly instead of
+        # downloading the entire file through Streamlit.
+        st.video(
+            video_url,
+            format=video_format,
+            width="stretch",
+        )
+
+        st.caption(f"▶️ Watching: {selected_video}")
+
+        # 6) Delete permanently
+        if st.button(
+            "🗑️ Delete Permanently",
+            type="secondary",
+            key=f"delete_{selected_video}",
+        ):
             try:
-                signed = supabase.storage.from_(BUCKET_NAME).create_signed_url(selected_video, 3600)
-                video_url = signed.get("signedURL") or signed.get("signedUrl")
+                result = (
+                    supabase.storage
+                    .from_(BUCKET_NAME)
+                    .remove([selected_video])
+                )
 
-                if video_url and not video_url.startswith("http"):
-                    base = url.rstrip("/")
-                    path = video_url if video_url.startswith("/") else "/" + video_url
-                    if not path.startswith("/storage/v1"):
-                        path = "/storage/v1" + path
-                    video_url = base + path
-            except Exception as e:
-                st.error(f"Could not create video link: {e}")
-
-            # 3) Play it, with a fallback that downloads the bytes directly
-            if video_url:
-                st.video(video_url)
-            else:
-                with st.spinner("Loading video..."):
-                    try:
-                        data = supabase.storage.from_(BUCKET_NAME).download(selected_video)
-                        st.video(data)
-                    except Exception as e:
-                        st.error(f"Could not load video: {e}")
-
-            st.caption(f"Streaming: {selected_video}")
-
-            if st.button("🗑️ Delete Permanently"):
-                supabase.storage.from_(BUCKET_NAME).remove([selected_video])
+                st.success("Video deleted permanently.")
                 st.rerun()
+
+            except Exception as e:
+                st.error(f"Could not delete video: {e}")
+```
