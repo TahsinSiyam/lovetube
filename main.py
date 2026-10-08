@@ -1,7 +1,16 @@
 import hmac
+import os
+import shutil
+import subprocess
+import tempfile
+
 import streamlit as st
 from supabase import create_client, Client
 
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 st.set_page_config(
     page_title="StreamlitTube Pro",
@@ -10,7 +19,10 @@ st.set_page_config(
 )
 
 
-# --- 1. CONNECTION ---
+# ============================================================
+# 1. SUPABASE CONNECTION
+# ============================================================
+
 try:
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
@@ -27,7 +39,10 @@ except Exception:
     st.stop()
 
 
-# --- 2. LOGIN GATE ---
+# ============================================================
+# 2. LOGIN GATE
+# ============================================================
+
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -42,19 +57,22 @@ def check_credentials(username: str, password: str) -> bool:
         return False
 
     user_ok = hmac.compare_digest(
-        username.encode(),
-        correct_user.encode(),
+        username.encode("utf-8"),
+        correct_user.encode("utf-8"),
     )
 
     pass_ok = hmac.compare_digest(
-        password.encode(),
-        correct_pass.encode(),
+        password.encode("utf-8"),
+        correct_pass.encode("utf-8"),
     )
 
     return user_ok and pass_ok
 
 
-# --- LOGIN PAGE ---
+# ============================================================
+# LOGIN PAGE
+# ============================================================
+
 if not st.session_state.authenticated:
 
     st.title("🔐 Private Site")
@@ -83,12 +101,15 @@ if not st.session_state.authenticated:
                 st.rerun()
 
             else:
+
                 st.error("Invalid username or password.")
 
     st.stop()
 
 
-# --- 3. APP (only reachable after login) ---
+# ============================================================
+# 3. MAIN APPLICATION
+# ============================================================
 
 st.title("🎬 StreamlitTube: Permanent Edition")
 
@@ -100,7 +121,10 @@ page = st.sidebar.radio(
 )
 
 
-# --- LOGOUT ---
+# ============================================================
+# LOGOUT
+# ============================================================
+
 st.sidebar.divider()
 
 if st.sidebar.button("Log out"):
@@ -111,12 +135,173 @@ if st.sidebar.button("Log out"):
 
 
 # ============================================================
-# UPLOAD
+# VIDEO CONVERSION
+# ============================================================
+
+def convert_to_h264(input_bytes: bytes, original_name: str):
+    """
+    Convert an uploaded video to a browser-friendly MP4.
+
+    Output:
+        Video: H.264
+        Audio: AAC
+        Container: MP4
+        Pixel format: yuv420p
+        Fast start: enabled
+
+    Returns:
+        tuple[bytes, str]
+    """
+
+    # Check that FFmpeg exists.
+    ffmpeg_path = shutil.which("ffmpeg")
+
+    if ffmpeg_path is None:
+        raise RuntimeError(
+            "FFmpeg is not installed on this server. "
+            "Install FFmpeg before uploading videos."
+        )
+
+    input_extension = os.path.splitext(original_name)[1]
+
+    if not input_extension:
+        input_extension = ".bin"
+
+    input_file = None
+    output_file = None
+
+    try:
+
+        # Create temporary input/output files.
+        input_temp = tempfile.NamedTemporaryFile(
+            suffix=input_extension,
+            delete=False,
+        )
+
+        input_file = input_temp.name
+
+        input_temp.write(input_bytes)
+        input_temp.close()
+
+        output_temp = tempfile.NamedTemporaryFile(
+            suffix=".mp4",
+            delete=False,
+        )
+
+        output_file = output_temp.name
+        output_temp.close()
+
+        # ----------------------------------------------------
+        # FFMPEG COMMAND
+        # ----------------------------------------------------
+
+        command = [
+            ffmpeg_path,
+
+            # Input
+            "-i",
+            input_file,
+
+            # Video
+            "-c:v",
+            "libx264",
+
+            # Good compatibility with browsers
+            "-pix_fmt",
+            "yuv420p",
+
+            # Quality
+            "-preset",
+            "veryfast",
+
+            "-crf",
+            "23",
+
+            # Audio
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "128k",
+
+            # Make MP4 streamable immediately
+            "-movflags",
+            "+faststart",
+
+            # Output
+            "-y",
+            output_file,
+        ]
+
+        # Run FFmpeg.
+        process = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # FFmpeg failed.
+        if process.returncode != 0:
+
+            raise RuntimeError(
+                "FFmpeg failed to convert the video.\n\n"
+                + process.stderr[-4000:]
+            )
+
+        # Make sure the output exists.
+        if not os.path.exists(output_file):
+
+            raise RuntimeError(
+                "FFmpeg completed but no output video was created."
+            )
+
+        # Read converted video.
+        with open(output_file, "rb") as f:
+            converted_bytes = f.read()
+
+        # Generate safe filename.
+        original_base = os.path.splitext(
+            os.path.basename(original_name)
+        )[0]
+
+        output_name = (
+            original_base
+            + ".mp4"
+        )
+
+        return converted_bytes, output_name
+
+    finally:
+
+        # Cleanup temporary files.
+        if input_file and os.path.exists(input_file):
+
+            try:
+                os.remove(input_file)
+            except OSError:
+                pass
+
+        if output_file and os.path.exists(output_file):
+
+            try:
+                os.remove(output_file)
+            except OSError:
+                pass
+
+
+# ============================================================
+# 4. UPLOAD PAGE
 # ============================================================
 
 if page == "Upload Video":
 
     st.header("📤 Upload to Permanent Cloud")
+
+    st.write(
+        "Videos are automatically converted to "
+        "**H.264 + AAC MP4** for browser compatibility."
+    )
 
     uploaded_file = st.file_uploader(
         "Choose video",
@@ -132,66 +317,95 @@ if page == "Upload Video":
         ],
     )
 
-    if st.button("Start Upload") and uploaded_file is not None:
+    if st.button(
+        "🚀 Start Upload",
+        type="primary",
+    ) and uploaded_file is not None:
 
-        with st.spinner("Uploading to cloud storage..."):
+        try:
 
-            try:
+            # ------------------------------------------------
+            # READ ORIGINAL FILE
+            # ------------------------------------------------
 
-                file_bytes = uploaded_file.getvalue()
+            with st.spinner(
+                "Reading uploaded video..."
+            ):
 
-                file_name = uploaded_file.name
+                original_bytes = uploaded_file.getvalue()
 
-                # Determine MIME type from file extension
-                extension = file_name.rsplit(".", 1)[-1].lower()
+                original_name = uploaded_file.name
 
-                mime_types = {
-                    "mp4": "video/mp4",
-                    "mov": "video/quicktime",
-                    "avi": "video/x-msvideo",
-                    "webm": "video/webm",
-                    "m4v": "video/mp4",
-                    "ogg": "video/ogg",
-                    "ogv": "video/ogg",
-                    "mkv": "video/x-matroska",
-                }
 
-                content_type = mime_types.get(
-                    extension,
-                    "application/octet-stream",
+            # ------------------------------------------------
+            # CONVERT VIDEO
+            # ------------------------------------------------
+
+            with st.spinner(
+                "🎞️ Converting to browser-compatible H.264..."
+            ):
+
+                converted_bytes, file_name = convert_to_h264(
+                    original_bytes,
+                    original_name,
                 )
 
-                supabase.storage.from_(BUCKET_NAME).upload(
+
+            # ------------------------------------------------
+            # UPLOAD TO SUPABASE
+            # ------------------------------------------------
+
+            with st.spinner(
+                "☁️ Uploading converted video to cloud..."
+            ):
+
+                supabase.storage.from_(
+                    BUCKET_NAME
+                ).upload(
                     path=file_name,
-                    file=file_bytes,
+                    file=converted_bytes,
                     file_options={
-                        "content-type": content_type,
+                        "content-type": "video/mp4",
+                        "cache-control": "3600",
+                        "upsert": "true",
                     },
                 )
 
-                st.success(
-                    f"Successfully pinned {file_name} to the cloud!"
-                )
 
-                st.balloons()
+            # ------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------
 
-            except Exception as e:
+            st.success(
+                f"Successfully uploaded {file_name}!"
+            )
 
-                st.error(
-                    f"Upload failed: {e}"
-                )
+            st.info(
+                "The uploaded copy is H.264/AAC MP4 "
+                "and should be browser-compatible."
+            )
+
+            st.balloons()
+
+
+        except Exception as e:
+
+            st.error(
+                f"Upload failed: {e}"
+            )
 
 
 # ============================================================
-# GALLERY
+# 5. PRIVATE VIDEO GALLERY
 # ============================================================
 
 else:
 
     st.header("🎥 Private Gallery")
 
+
     # --------------------------------------------------------
-    # 1. LIST VIDEOS
+    # LIST STORAGE FILES
     # --------------------------------------------------------
 
     try:
@@ -210,51 +424,39 @@ else:
         )
 
         st.info(
-            "Check that SUPABASE_KEY is the service_role "
-            "key, not the anon key."
+            "Check your Supabase credentials and "
+            "storage bucket permissions."
         )
 
         st.stop()
 
 
     # --------------------------------------------------------
-    # 2. FILTER VIDEO FILES
+    # FIND MP4 VIDEOS
     # --------------------------------------------------------
-
-    video_extensions = (
-        ".mp4",
-        ".webm",
-        ".mov",
-        ".m4v",
-        ".ogg",
-        ".ogv",
-        ".avi",
-        ".mkv",
-    )
 
     video_names = [
         f["name"]
         for f in (files or [])
         if f.get("name")
         and f["name"] != ".emptyFolderPlaceholder"
-        and f["name"].lower().endswith(video_extensions)
+        and f["name"].lower().endswith(".mp4")
     ]
 
 
     # --------------------------------------------------------
-    # 3. NO VIDEOS
+    # EMPTY GALLERY
     # --------------------------------------------------------
 
     if not video_names:
 
         st.info(
-            "No videos found. If you know you uploaded some, "
-            "your key may be the anon key or the bucket may be empty."
+            "No videos found."
         )
 
 
     # --------------------------------------------------------
-    # 4. VIDEO SELECTION
+    # VIDEO GALLERY
     # --------------------------------------------------------
 
     else:
@@ -272,7 +474,7 @@ else:
 
 
             # ------------------------------------------------
-            # 5. CREATE SIGNED URL
+            # CREATE SIGNED URL
             # ------------------------------------------------
 
             try:
@@ -288,8 +490,8 @@ else:
                 )
 
 
-                # Different supabase-py versions may use
-                # slightly different key capitalization.
+                # Handle different supabase-py response
+                # formats.
                 if isinstance(signed, dict):
 
                     video_url = (
@@ -302,19 +504,17 @@ else:
                 if not video_url:
 
                     raise ValueError(
-                        "Supabase did not return a signed URL. "
+                        "Supabase did not return a signed URL.\n"
                         f"Response: {signed}"
                     )
 
 
-                # Make sure we received a complete URL.
                 if not video_url.startswith(
                     ("http://", "https://")
                 ):
 
                     raise ValueError(
-                        "Invalid signed URL returned by Supabase: "
-                        f"{video_url}"
+                        "Supabase returned an invalid signed URL."
                     )
 
 
@@ -328,50 +528,12 @@ else:
 
 
             # ------------------------------------------------
-            # 6. DETERMINE VIDEO MIME TYPE
-            # ------------------------------------------------
-
-            extension = (
-                selected_video
-                .rsplit(".", 1)[-1]
-                .lower()
-            )
-
-
-            mime_types = {
-
-                "mp4": "video/mp4",
-
-                "webm": "video/webm",
-
-                "mov": "video/quicktime",
-
-                "m4v": "video/mp4",
-
-                "ogg": "video/ogg",
-
-                "ogv": "video/ogg",
-
-                "avi": "video/x-msvideo",
-
-                "mkv": "video/x-matroska",
-
-            }
-
-
-            video_format = mime_types.get(
-                extension,
-                "video/mp4",
-            )
-
-
-            # ------------------------------------------------
-            # 7. PLAY VIDEO DIRECTLY FROM SUPABASE
+            # PLAY VIDEO
             # ------------------------------------------------
 
             st.video(
                 video_url,
-                format=video_format,
+                format="video/mp4",
                 width="stretch",
             )
 
@@ -382,7 +544,7 @@ else:
 
 
             # ------------------------------------------------
-            # 8. DELETE VIDEO
+            # DELETE VIDEO
             # ------------------------------------------------
 
             if st.button(
